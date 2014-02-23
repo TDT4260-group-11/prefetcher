@@ -1,0 +1,249 @@
+#include "interface.hh"
+#include <stdlib.h>
+#include <stdio.h>
+
+// Settings
+#define HISTORY_SIZE 8
+#define PATTERNS_STORED_SIZE 512
+#define PATTERNS_MATCH_SIZE 2
+#define PATTERNS_PREDICT_SIZE 2
+
+//==================
+// Helper Functions
+//==================
+
+void prefetch_if_not_cached(Addr addr)
+{
+    if (!in_cache(addr) && 0 <= addr && addr < MAX_PHYS_MEM_ADDR)
+    {
+        issue_prefetch(addr);
+    }
+}
+
+//=========
+// History 
+//=========
+
+AccessStat *history;
+int history_index;
+
+void history_init(void)
+{
+    history = (AccessStat*) calloc(sizeof(AccessStat), HISTORY_SIZE);
+    history_index = HISTORY_SIZE-1;
+}
+
+void history_store(AccessStat stat)
+{
+    history_index = (history_index + 1) % HISTORY_SIZE;
+    history[history_index] = stat;
+}
+
+AccessStat history_get(int i) // 0 = current, 1 = previous, etc
+{
+    int index = (history_index - i + HISTORY_SIZE) % HISTORY_SIZE;
+    return history[index];
+}
+
+//==========
+// Patterns
+//==========
+
+typedef struct {
+    int32_t score;
+    int32_t jumps[PATTERNS_MATCH_SIZE + PATTERNS_PREDICT_SIZE];
+} Pattern;
+
+Pattern *patterns_stored;
+
+void patterns_init(void)
+{
+    // Allocate memory
+    patterns_stored = (Pattern*) calloc(sizeof(Pattern), PATTERNS_STORED_SIZE);
+}
+
+void pattern_match(Pattern *pat, int32_t *pat_id, int32_t *pat_score)
+{
+    // Reset
+    *pat_id = -1;
+    *pat_score = 0;
+    
+    // Check for match
+    for (int i = 0; i < PATTERNS_STORED_SIZE; i++)
+    {
+        int score = 0;
+        for (int j = 0; j < PATTERNS_MATCH_SIZE; j++)
+        {
+            if ((*pat).jumps[j] == patterns_stored[i].jumps[j])
+                score++;
+            else
+                break;
+        }
+        score *= (*pat).score;
+        if (score > *pat_score)
+        {
+            *pat_id = i;
+            *pat_score = score;
+        }
+    }
+}
+
+void pattern_match_perfect(Pattern *pat, int32_t *pat_id)
+{
+    // Reset
+    *pat_id = -1;
+    
+    // Check for match
+    for (int i = 0; i < PATTERNS_STORED_SIZE; i++)
+    {
+        int equal = 1;
+        for (int j = 0; j < PATTERNS_MATCH_SIZE + PATTERNS_PREDICT_SIZE; j++)
+        {
+            if ((*pat).jumps[j] != patterns_stored[i].jumps[j])
+                equal = 0;
+        }
+        if (equal == 1)
+        {
+            *pat_id = i;
+            break;
+        }
+    }
+}
+
+void pattern_current(Pattern *pat)
+{
+    (*pat).score = 1;
+    
+    // Calc jumps
+    for (int i = 0; i < PATTERNS_MATCH_SIZE + PATTERNS_PREDICT_SIZE; i++)
+    {
+        int history_i = PATTERNS_MATCH_SIZE + PATTERNS_PREDICT_SIZE - i - 1;
+        (*pat).jumps[i] = history_get(history_i).mem_addr - history_get(history_i+1).mem_addr;
+    }
+}
+
+void pattern_pad(Pattern *pat, int padding)
+{
+    for (int i = 0; i < PATTERNS_MATCH_SIZE + PATTERNS_PREDICT_SIZE-padding; i++)
+    {
+        pat->jumps[i] = pat->jumps[i+padding];
+    }
+    for (int i = PATTERNS_MATCH_SIZE + PATTERNS_PREDICT_SIZE-padding; i < PATTERNS_MATCH_SIZE + PATTERNS_PREDICT_SIZE; i++)
+    {
+        pat->jumps[i] = 0;
+    }
+}
+
+void pattern_worst(int32_t *pat_id)
+{
+    // Find pattern with lowest score
+    int lowest_score = 0;
+    int lowest_i = 0;
+    for (int i = 0; i < PATTERNS_STORED_SIZE; i++)
+    {
+        if (patterns_stored[i].score > lowest_score)
+        {
+            lowest_score = patterns_stored[i].score;
+            lowest_i = i;
+        }
+    }
+    *pat_id = lowest_i;
+}
+
+void pattern_check(void)
+{
+    // Get
+    Pattern pat;
+    pattern_current(&pat);
+    pattern_pad(&pat, PATTERNS_PREDICT_SIZE);
+    
+    // Best match
+    int32_t id;
+    int32_t score;
+    pattern_match(&pat, &id, &score);
+    
+    // Predict
+    if (score > PATTERNS_MATCH_SIZE)
+    {
+        Pattern pat_match = patterns_stored[id];
+        Addr addr = history_get(0).mem_addr;
+        for (int i = PATTERNS_MATCH_SIZE; i < PATTERNS_MATCH_SIZE - PATTERNS_PREDICT_SIZE; i++)
+        {
+            addr += pat_match.jumps[i];  
+            prefetch_if_not_cached(addr);
+        }
+    }
+    
+    // Check for perfect match
+    int32_t id_perfect;
+    pattern_match_perfect(&pat, &id_perfect);
+    
+    if (id_perfect < 0)
+    {
+        // Overwrite worst
+        int32_t id_worst;
+        pattern_worst(&id_worst);
+        pattern_current(&patterns_stored[id_worst]);
+    }
+    else
+    {
+        // Increase score
+        patterns_stored[id_perfect].score++;
+    }
+}
+
+void patterns_age(void)
+{
+    // Check for match
+    for (int i = 0; i < PATTERNS_STORED_SIZE; i++)
+    {
+        patterns_stored[i].score--;
+    }
+}
+
+//===========
+// Framework 
+//===========
+
+void prefetch_init(void)
+{
+    printf("Initializing...");
+    history_init();
+    patterns_init();
+}
+
+int counter = 0;
+
+void prefetch_access(AccessStat stat)
+{
+    // Store statistics
+    printf("Storing...\n");
+    history_store(stat);
+    
+    printf("Checking...\n");
+    pattern_check();
+    
+    counter = (counter + 1) % PATTERNS_STORED_SIZE;
+    if (counter == 0)
+    {
+        printf("Aging...");
+        patterns_age();
+    }
+    
+    /*
+    // Prefetch next block
+    Addr addr_next = stat.mem_addr + BLOCK_SIZE;
+    prefetch_if_not_cached(addr_next);
+    
+    // Prefetch linearly projected block
+    Addr delta2 = history_get(0).mem_addr - history_get(1).mem_addr;
+    Addr addr_projected = stat.mem_addr + delta2;
+    prefetch_if_not_cached(addr_projected);
+    */
+}
+
+void prefetch_complete(Addr addr)
+{
+    // YOLO
+}
+
