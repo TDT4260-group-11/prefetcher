@@ -2,25 +2,26 @@
 #include <stdlib.h>
 #include <stdio.h>
 
-// For GHB sizes up to 1024, KB_SIZE+GHB_SIZE can be 1724 (8KB)
-// For GHB sizes up to 2024, KB_SIZE+GHB_SIZE can be 1680 (8KB)
+// For GHB sizes up to 1024, KB_SIZE+GHB_SIZE can be 1724 (8KB) : 28+10 bits per line
+// For GHB sizes up to 2048, KB_SIZE+GHB_SIZE can be 1680 (8KB) : 28+11 bits per line
 
 // Magic Numbers
 #define VERBOSE 1
 #define CALIBRATION_INTERVAL (2*1024)
-#define KB_SIZE 256
+#define KB_SIZE 512
 #define GHB_SIZE 1024
-#define MATCH_DEGREE 4
-#define PREFETCH_DEGREE_MIN 0
-#define PREFETCH_DEGREE_DEFAULT 0
-#define PREFETCH_DEGREE_MAX 16
+#define MATCH_DEGREE 2
+#define LOOKBACK_AMOUNT 64
+#define PREFETCH_DEGREE_DEFAULT 1
+#define PREFETCH_DEGREE_MAX 4
 #define STORE_MISSES_ONLY 0
 #define CZONE_MODE 0
 #define CZONE_BITS_MIN 12
 #define CZONE_BITS_DEFAULT 16
 #define CZONE_BITS_MAX 20
-#define COUNTDOWN_SHORT 4
+#define COUNTDOWN_SHORT 2
 #define COUNTDOWN_LONG 16
+#define RATE_FACTOR 1000000
 
 // Prototypes
 void prefetcher_init();
@@ -43,14 +44,19 @@ void stats_reset()
     stat_issued_hits = 1;
 }
 
-int64_t stats_hit_ratio()
+int64_t stats_hit_rate()
 {
-    return (stat_read_hits*1000000) / (stat_read);
+    return (stat_read_hits*RATE_FACTOR) / (stat_read);
 }
 
-int64_t stats_issued_hit_ratio()
+int64_t stats_issued_hit_rate()
 {
-    return (stat_issued_hits*1000000) / stat_issued;
+    return (stat_issued_hits*RATE_FACTOR) / stat_issued;
+}
+
+int64_t stats_rate(int64_t rate_a, int64_t rate_b)
+{
+    return (rate_a*RATE_FACTOR) / (rate_b);
 }
 
 //=========
@@ -243,6 +249,12 @@ void prefetcher_access(AccessStat stat)
 
 void prefetcher_delta_correlate()
 {
+    // Skip if no prefetching
+    if (prefetch_degree == 0)
+    {
+        return;
+    }
+    
     // Create a buffer for deltas
     int buffer_head = -1;
     int buffer_size = prefetch_degree + MATCH_DEGREE;
@@ -253,12 +265,12 @@ void prefetcher_delta_correlate()
     GHB_Index index_previous = 0;
     
     // For storing the comparison deltas
-    GHB_Index deltas[MATCH_DEGREE]; //TODO: Why is GHB_Index better than GHB_Address???
+    GHB_Address deltas[MATCH_DEGREE]; //TODO: GHB_Index better than GHB_Address???
     
     // Get latest address
     GHB_Address address = ghb[ghb_head].address;
     
-    for (int i = 0; i < KB_SIZE; i++)
+    for (int i = 0; i < LOOKBACK_AMOUNT; i++)
     {
         // Get previous
         index_previous = ghb[index_current].previous;
@@ -304,15 +316,336 @@ void prefetcher_delta_correlate()
                     issue_if_needed(address);
                     buffer_i = (buffer_i - 1 + buffer_size) % buffer_size;
                 }
-                if (VERBOSE >= 2) printf("Prefetching %d blocks!\n", prefetch_degree);
+                if (VERBOSE >= 2) printf("Prefetching blocks! (degree %d)\n", prefetch_degree);
                 break;
             }
         }
     }
-    
-    
 }
 
+#define BLOCKED_TIME 8
+#define INCREASE_THRESHOLD ((RATE_FACTOR*95)/100)
+#define DECREASE_THRESHOLD ((RATE_FACTOR*50)/100)
+
+int action = 0;
+int last_hit_rate = 0;
+int blocked[PREFETCH_DEGREE_MAX + 1];
+int first_run = 1;
+
+void prefetcher_calibrate()
+{
+    // First run stuff
+    if (first_run)
+    {
+        // Clear calibration
+        for (int i = 0; i <= PREFETCH_DEGREE_MAX; i++)
+        {
+            blocked[i] = BLOCKED_TIME;
+        }
+        
+        // Reset stats
+        stats_reset();
+        
+        first_run = 0;
+        return;
+    }
+    
+    // Get stats
+    int hit_rate = stats_hit_rate();
+    int issued_hit_rate = stats_issued_hit_rate();
+    
+    int better = hit_rate > ((last_hit_rate*103)/100);
+    int worse = hit_rate < ((last_hit_rate*97)/100);
+    
+    // Increased PFD last
+    if (action == 1)
+    {
+        if (better)
+        {
+            for (int i = 0; i < prefetch_degree; i++)
+            {
+                blocked[i] = BLOCKED_TIME;
+            }
+        }
+        if (worse)
+        {
+            for (int i = prefetch_degree; i <= PREFETCH_DEGREE_MAX; i++)
+            {
+                blocked[i] = BLOCKED_TIME;
+            }
+        }
+    }
+    
+    // Decreased PFD last
+    if (action == -1)
+    {
+        if (better)
+        {
+            for (int i = prefetch_degree + 1; i <= PREFETCH_DEGREE_MAX; i++)
+            {
+                blocked[i] = BLOCKED_TIME;
+            }
+        }
+        if (worse)
+        {
+            for (int i = 0; i <= prefetch_degree; i++)
+            {
+                blocked[i] = BLOCKED_TIME;
+            }
+        }
+    }
+    
+    // Explore if able
+    action = 0;
+    if (blocked[prefetch_degree + 1] <= 0 && prefetch_degree < PREFETCH_DEGREE_MAX)
+    {
+        action = 1;
+    }
+    if (blocked[prefetch_degree - 1] <= 0 && prefetch_degree > 0)
+    {
+        action = -1;
+    }
+    
+    // Override if issued hit rate is very high or low
+    int issued_override = 0;
+    /*
+    if (issued_hit_rate > INCREASE_THRESHOLD && prefetch_degree < PREFETCH_DEGREE_MAX)
+    {
+        action = 1;
+        issued_override = 1;
+    }
+    if (issued_hit_rate < DECREASE_THRESHOLD && prefetch_degree > 0)
+    {
+        action = -1;
+        issued_override = 1;
+    }
+    */
+    
+    if (VERBOSE >= 1)
+    {
+        printf("[] Calibrating...\n");
+        printf(" - Old PFD: %d\n", prefetch_degree);
+        printf(" - New PFD: %d\n", prefetch_degree + action);
+        printf(" - Old hit rate: %d\n", last_hit_rate);
+        printf(" - New hit rate: %d\n", hit_rate);
+        printf(" - Better: %d\n", better);
+        printf(" - Worse: %d\n", worse);
+        printf(" - Issued hit rate: %d\n", issued_hit_rate);
+        printf(" - Issued Override: %d\n", issued_override);
+        printf(" - Blocked:");
+        for (int i = 0; i <= PREFETCH_DEGREE_MAX; i++)
+        {
+            printf(" %d,", blocked[i]);
+        }
+        printf("\n");
+    }
+    
+    // Countdown blocks
+    for (int i = 0; i <= PREFETCH_DEGREE_MAX; i++)
+    {
+        blocked[i]--;
+    }
+    
+    // Updates stuff
+    prefetch_degree = prefetch_degree + action;
+    last_hit_rate = hit_rate;
+    
+    // Reset stats
+    stats_reset();
+}
+
+
+/*
+#define TIME_THRESHOLD 32
+
+// Data structure to store hit rates
+int hit_rates[PREFETCH_DEGREE_MAX+1];
+int hit_times[PREFETCH_DEGREE_MAX+1];
+int first_run = 1;
+
+void prefetcher_calibrate()
+{
+    // First run stuff
+    if (first_run)
+    {
+        // Clear calibration
+        for (int i = 0; i <= PREFETCH_DEGREE_MAX; i++)
+        {
+            hit_rates[i] = 0;
+            hit_times[i] = TIME_THRESHOLD;
+        }
+        
+        // Reset stats
+        stats_reset();
+        
+        first_run = 0;
+        return;
+    }
+
+    // Get stats
+    int hit_rate = stats_hit_rate();
+    //int issued_hit_rate = stats_issued_hit_rate();
+    
+    // Store rates and update time
+    hit_rates[prefetch_degree] = hit_rate;
+    for (int i = 0; i <= PREFETCH_DEGREE_MAX; i++)
+    {
+        hit_times[i] += 1;
+    }
+    hit_times[prefetch_degree] = 0;
+    
+    
+    int next_prefetch_degree = prefetch_degree;
+    
+    // Time to check another prefetch degree?
+    if (prefetch_degree == 0)
+    {
+        if (hit_times[prefetch_degree + 1] > TIME_THRESHOLD)
+        {
+            next_prefetch_degree = prefetch_degree + 1;
+        }
+        else
+        {
+            if (hit_rates[prefetch_degree + 1] > hit_rates[prefetch_degree])
+            {
+                next_prefetch_degree = prefetch_degree + 1;
+            }
+        }
+    }
+    else if (prefetch_degree == PREFETCH_DEGREE_MAX)
+    {
+        if (hit_times[prefetch_degree - 1] > TIME_THRESHOLD)
+        {
+            next_prefetch_degree = prefetch_degree - 1;
+        }
+        else
+        {
+            if (hit_rates[prefetch_degree - 1] > hit_rates[prefetch_degree])
+            {
+                next_prefetch_degree = prefetch_degree - 1;
+            }
+        }
+    }
+    else
+    {
+        if (hit_times[prefetch_degree + 1] > TIME_THRESHOLD)
+        {
+            next_prefetch_degree = prefetch_degree + 1;
+        }
+        else
+        if (hit_times[prefetch_degree - 1] > TIME_THRESHOLD)
+        {
+            next_prefetch_degree = prefetch_degree - 1;
+        }
+        else
+        {
+            if (hit_rates[prefetch_degree + 1] > hit_rates[next_prefetch_degree])
+            {
+                next_prefetch_degree = prefetch_degree + 1;
+            }
+            if (hit_rates[prefetch_degree - 1] > hit_rates[next_prefetch_degree])
+            {
+                next_prefetch_degree = prefetch_degree - 1;
+            }
+        }
+    }
+    
+    if (VERBOSE >= 1)
+    {
+        printf("[] Calibrating...\n");
+        printf(" - Old PFD: %d\n", prefetch_degree);
+        printf(" - New PFD: %d\n", next_prefetch_degree);
+        printf(" - Hit rates:");
+        for (int i = 0; i <= PREFETCH_DEGREE_MAX; i++)
+        {
+            printf(" %d,", hit_rates[i]);
+        }
+        printf("\n");
+        printf(" - Hit times:");
+        for (int i = 0; i <= PREFETCH_DEGREE_MAX; i++)
+        {
+            printf(" %d,", hit_times[i]);
+        }
+        printf("\n");
+    }
+    
+    // Update degree
+    prefetch_degree = next_prefetch_degree;
+    
+    // Reset stats
+    stats_reset();
+}
+*/
+
+/*
+#define INC_THRESHOLD ((RATE_FACTOR*90)/100)
+#define DEC_THRESHOLD ((RATE_FACTOR*70)/100)
+
+int countdown = COUNTDOWN_LONG;
+
+void prefetcher_calibrate()
+{
+    if (countdown > 0)
+    {
+        countdown--;
+        return;
+    }
+    
+    int hit_rate = stats_hit_rate();
+    int issued_hit_rate = stats_issued_hit_rate();
+    //int above_threshold = issued_hit_rate > INC_THRESHOLD;
+    //int below_threshold = issued_hit_rate < DEC_THRESHOLD;
+    int above_threshold = (issued_hit_rate > (hit_rate*100)/100)
+        || (issued_hit_rate > ((RATE_FACTOR*95)/100));
+    int below_threshold = issued_hit_rate < (hit_rate*95)/100;
+    
+    
+    // Determine next PFD
+    int next_prefetch_degree = prefetch_degree;
+    if (prefetch_degree == 0)
+    {
+        next_prefetch_degree = prefetch_degree + 1;
+    }
+    else if (above_threshold && prefetch_degree < PREFETCH_DEGREE_MAX)
+    {
+        next_prefetch_degree = prefetch_degree + 1;
+    }
+    else if (below_threshold)
+    {
+        next_prefetch_degree = prefetch_degree - 1;
+    }
+    
+    // Set countdown
+    if (next_prefetch_degree == prefetch_degree || next_prefetch_degree == 0)
+    {
+        countdown = COUNTDOWN_LONG;
+    }
+    else
+    {
+        countdown = COUNTDOWN_SHORT;
+    }
+    
+    if (VERBOSE >= 1)
+    {
+        printf("[] Calibrating...\n");
+        printf(" - Hit rate: %d\n", hit_rate);
+        printf(" - Issued hit rate: %d\n", issued_hit_rate);
+        printf(" - Above threshold: %d\n", above_threshold);
+        printf(" - Below threshold: %d\n", below_threshold);
+        printf(" - Old PFD: %d\n", prefetch_degree);
+        printf(" - New PFD: %d\n", next_prefetch_degree);
+        printf(" - Countdown: %d\n", countdown);
+    }
+    
+    // Update degree
+    prefetch_degree = next_prefetch_degree;
+    
+    // Reset stats
+    stats_reset();
+}
+*/
+
+/*
 #define CHECK_CURRENT 0
 #define CHECK_LOWER 1
 #define CHECK_HIGHER 2
@@ -329,7 +662,7 @@ int countdown_left = 0;
 
 void prefetcher_calibrate()
 {
-    int score = stats_hit_ratio();
+    int score = stats_hit_rate();
     int state_next = state;
     
     if (state == CHECK_CURRENT)
@@ -420,4 +753,4 @@ void prefetcher_calibrate()
     // Reset stats
     stats_reset();
 }
-
+*/
