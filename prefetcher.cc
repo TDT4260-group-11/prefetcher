@@ -15,7 +15,7 @@
 #define DCPT_DELTA_DISCARD_BITS 4 /* 2^4 = 32, block size is 64 */
 #define DCPT_DELTA_MAX ((1 << (DCPT_DELTA_BITS - 1)) - 1)
 #define DCPT_DELTA_MIN (0 - DCPT_DELTA_MAX)
-#define DCPT_DISCARD_ENABLED 1
+#define DCPT_DISCARD_ENABLED 0
 #define PREFETCH_DEGREE_MAX 4
 
 /* Prototypes */
