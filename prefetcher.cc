@@ -225,12 +225,10 @@ int dcpt_candidates_find(DCPT_Entry *entry)
                 {
                     x = 0;
                 }
-                
             }
             return x;
         }
     }
-    
     return 0;
 }
 
