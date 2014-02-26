@@ -2,8 +2,8 @@
 #include <stdlib.h>
 #include <stdio.h>
 
-/* Bits per entry: 28*3 + 16*n + roof(sqrt(n)) */
-/* n = 16 gives 344 bits (43 bytes) which allows 188 rows (8096 B / 43 B = 188.28) */
+/* Bits per entry: 28*3 + b*n + roof(sqrt(n)) where b = bits/delta and n = deltas/entry */
+/* b = 16, n = 16 gives 344 bits (43 bytes) which allows 188 rows (8096 B / 43 B = 188.28) */
 
 /* Magic Numbers */
 #define VERBOSE 1
