@@ -15,6 +15,7 @@
 #define DCPT_DELTA_DISCARD_BITS 4 /* 2^4 = 32, block size is 64 */
 #define DCPT_DELTA_MAX ((1 << (DCPT_DELTA_BITS - 1)) - 1)
 #define DCPT_DELTA_MIN (0 - DCPT_DELTA_MAX)
+#define DCPT_DISCARD_ENABLED 1
 #define PREFETCH_DEGREE_MAX 4
 
 /* Prototypes */
@@ -134,9 +135,10 @@ typedef struct {
     DCPT_Index delta_head;
 } DCPT_Entry;
 
-DCPT_Entry *dcpt;
 int dcpt_head;
 int dcpt_size;
+DCPT_Entry *dcpt;
+DCPT_Addr dcpt_candidates[DCPT_DELTAS];
 
 /* Initializes table */
 void dcpt_init(int size)
@@ -192,33 +194,44 @@ void dcpt_delta_store(DCPT_Entry *entry, DCPT_Delta delta)
     entry->delta[entry->delta_head] = delta;
 }
 
-void dcpt_delta_correlate(DCPT_Entry *entry)
+/* Finds candidate prefetch addresses */
+/* Returns number of candidates */
+int dcpt_candidates_find(DCPT_Entry *entry)
 {
     DCPT_Delta delta_a = dcpt_delta_get(entry, 0);
     DCPT_Delta delta_b = dcpt_delta_get(entry, 1);
-    if (delta_a == 0 || delta_b == 0) return; /* Overflow */
+    if (delta_a == 0 || delta_b == 0) return 0; /* Overflow */
     
     for (int i = 1; i < DCPT_DELTAS-1; i++)
     {
         if (dcpt_delta_get(entry, i) == delta_a && dcpt_delta_get(entry, i+1) == delta_b)
         {
-            /* TODO: last_prefetch and discard */
+            /* Number of candidates */
+            int x = 0;
+            
             DCPT_Addr addr = entry->last_address;
-            for (int k = 0; k < i && k < PREFETCH_DEGREE_MAX; k++)
+            
+            for (int k = 0; k < i; k++)
             {
                 DCPT_Delta delta = dcpt_delta_get(entry, i-k-1);
                 if (delta == 0) break; /* Overflow */
                 
+                /* Add candidate */
                 addr += delta << DCPT_DELTA_DISCARD_BITS;
-                issue_if_needed(addr);
+                dcpt_candidates[x++] = addr;
                 
-                entry->last_prefetch = addr;
+                /* Discard all candidates if previous prefetch found */
+                if (addr == entry->last_prefetch && DCPT_DISCARD_ENABLED)
+                {
+                    x = 0;
+                }
+                
             }
-            break;
+            return x;
         }
     }
     
-    
+    return 0;
 }
 
 /*============*/
@@ -261,8 +274,14 @@ void prefetcher_access(AccessStat stat)
         /* Update last address */
         entry->last_address = addr;
         
-        /* Run delta correlation */
-        dcpt_delta_correlate(entry);
+        /* Find and prefetch candidates */
+        int c = dcpt_candidates_find(entry);
+        for (int i = 0; i < c && i < PREFETCH_DEGREE_MAX; i++)
+        {
+            DCPT_Addr addr = dcpt_candidates[i];
+            issue_if_needed(addr);
+            entry->last_prefetch = addr;
+        }
     }
 }
 
