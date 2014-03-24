@@ -16,7 +16,10 @@
 #define DCPT_DELTA_MAX ((1 << (DCPT_DELTA_BITS - 1)) - 1)
 #define DCPT_DELTA_MIN (0 - DCPT_DELTA_MAX)
 #define DCPT_DISCARD_ENABLED 0
-#define PREFETCH_DEGREE_MAX 4
+#define DCPT_PARTIAL_MASK_BITS 10
+#define DCPT_PARTIAL_MASK ((1 << DCPT_PARTIAL_MASK_BITS)-1)
+#define PREFETCH_DEGREE_MAX 3
+#define PREFETCH_DEGREE_PARTIAL_MAX 2
 
 /* Prototypes */
 void prefetcher_init();
@@ -232,6 +235,44 @@ int dcpt_candidates_find(DCPT_Entry *entry)
     return 0;
 }
 
+/* Finds partial candidate prefetch addresses */
+/* Returns number of partial candidates */
+int dcpt_candidates_find_partial(DCPT_Entry *entry)
+{
+    DCPT_Delta delta_a = dcpt_delta_get(entry, 0);
+    DCPT_Delta delta_b = dcpt_delta_get(entry, 1);
+    if (delta_a == 0 || delta_b == 0) return 0; /* Overflow */
+    
+    for (int i = 1; i < DCPT_DELTAS-1; i++)
+    {
+        if (dcpt_delta_get(entry, i) | DCPT_PARTIAL_MASK == delta_a | DCPT_PARTIAL_MASK &&
+            dcpt_delta_get(entry, i+1) | DCPT_PARTIAL_MASK == delta_b | DCPT_PARTIAL_MASK)
+        {
+            /* Number of candidates */
+            int x = 0;
+            
+            DCPT_Addr addr = entry->last_address;
+            
+            for (int k = 0; k < i; k++)
+            {
+                DCPT_Delta delta = dcpt_delta_get(entry, i-k-1);
+                if (delta == 0) break; /* Overflow */
+                
+                /* Add candidate */
+                addr += delta << DCPT_DELTA_DISCARD_BITS;
+                dcpt_candidates[x++] = addr;
+                
+                /* Discard all candidates if previous prefetch found */
+                if (addr == entry->last_prefetch && DCPT_DISCARD_ENABLED)
+                {
+                    x = 0;
+                }
+            }
+            return x;
+        }
+    }
+    return 0;
+}
 /*============*/
 /* Prefetcher */
 /*============*/
@@ -274,7 +315,14 @@ void prefetcher_access(AccessStat stat)
         
         /* Find and prefetch candidates */
         int c = dcpt_candidates_find(entry);
-        for (int i = 0; i < c && i < PREFETCH_DEGREE_MAX; i++)
+        int max = PREFETCH_DEGREE_MAX;
+        if (c == 0)
+        {
+            /* Fallback to partial matching */
+            c = dcpt_candidates_find_partial(entry);
+            max = PREFETCH_DEGREE_PARTIAL_MAX;
+        }
+        for (int i = 0; i < c && i < max; i++)
         {
             DCPT_Addr addr = dcpt_candidates[i];
             issue_if_needed(addr);
