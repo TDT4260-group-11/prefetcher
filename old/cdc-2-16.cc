@@ -324,8 +324,8 @@ void prefetcher_calibrate()
     {
         printf("[] Calibrating...\n");
         printf(" - PFD: %d\n", prefetch_degree);
-        printf(" - Hit rate: %d\n", hit_rate);
-        printf(" - Issued hit rate: %d\n", issued_hit_rate);
+        printf(" - Hit rate: %d\n", (int) stats_hit_rate());
+        printf(" - Issued hit rate: %d\n", (int) stats_issued_hit_rate());
     }
     
     // Reset stats
